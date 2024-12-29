@@ -1,13 +1,13 @@
 import os
 import tempfile
+
 import streamlit as st
-
 from langchain.chains import ConversationalRetrievalChain, LLMChain
-from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
+from langchain_openai import ChatOpenAI
 
+import data_utils  # 负责文件处理、向量数据库构建等工具函数
 import ui  # 负责页面UI相关的函数（这里已修改为多栏对话）
-import data_utils  # 负责PDF/Text处理、向量数据库构建等工具函数
 
 # 从环境变量读取 DeepSeek 的 API Key
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")  # 请确保安全
@@ -47,79 +47,77 @@ def main():
 
     # 初始化 session_state 变量
     if 'vector_store' not in st.session_state:
-        st.session_state.vector_store = {}
+        # 初始化一个全局的 vector_store
+        st.session_state.vector_store = data_utils.initialize_vector_store()
+
     if 'qa_chain' not in st.session_state:
         st.session_state.qa_chain = {}
+
     if 'fallback_chain' not in st.session_state:
         st.session_state.fallback_chain = fallback_chain
 
-    # 加载或初始化会话相关的数据
-    if selected_session not in st.session_state.vector_store:
-        # 定义 vector_store_path 并初始化为 None
-        vector_store_path = os.path.join(data_utils.VECTOR_STORE_DIR, f"{selected_session}.faiss")
-        st.session_state.vector_store[selected_session] = None
-        st.session_state.vector_store_path = vector_store_path
-    else:
-        vector_store_path = os.path.join(data_utils.VECTOR_STORE_DIR, f"{selected_session}.faiss")
-        st.session_state.vector_store_path = vector_store_path
-
-    if selected_session not in st.session_state.qa_chain:
-        st.session_state.qa_chain[selected_session] = None
+    st.session_state.vector_store_path = data_utils.VECTOR_STORE_PATH
 
     # 加载对话历史
     if 'conversation_history' not in st.session_state:
         st.session_state.conversation_history = {}
+
+    if 'selected_session' not in st.session_state:
+        st.session_state.selected_session = None
     if selected_session not in st.session_state.conversation_history:
-        st.session_state.conversation_history[selected_session] = data_utils.initialize_conversation_history(selected_session)
-
+        st.session_state.conversation_history[selected_session] = data_utils.initialize_conversation_history(
+            selected_session)
     # 左侧上传PDF文件（支持多文件）
-    uploaded_files = ui.render_pdf_upload_sidebar()
+    uploaded_files = ui.render_document_upload_sidebar()
 
-    # 处理文件上传
     if uploaded_files:
         documents = []
         for uploaded_file in uploaded_files:
-            # 处理多文件：将每个文件都存到临时文件再解析
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-                tmp_file.write(uploaded_file.read())
-                tmp_file_path = tmp_file.name
+            try:
+                # 获取文件扩展名
+                _, ext = os.path.splitext(uploaded_file.name)
+                ext = ext.lower()
 
-            st.sidebar.info(f"正在处理文件: {uploaded_file.name}")
+                if ext not in ['.pdf', '.docx', '.txt', '.md']:
+                    st.sidebar.error(f"不支持的文件类型: {ext}")
+                    continue
 
-            # 从文件中加载文本
-            text = data_utils.load_document(tmp_file_path)
-            if text:
-                # 将文档拆分成多个块
-                doc_chunks = data_utils.prepare_documents(text)
-                documents.extend(doc_chunks)
-                st.sidebar.success(f"已成功加载 {uploaded_file.name}")
-            else:
-                st.sidebar.error(f"无法从 {uploaded_file.name} 中提取文本。")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp_file:
+                    tmp_file.write(uploaded_file.read())
+                    tmp_file_path = tmp_file.name
 
+                text = data_utils.load_document(tmp_file_path)
+                if text:
+                    doc_chunks = data_utils.prepare_documents(text)
+                    documents.extend(doc_chunks)
+                    st.sidebar.success(f"已成功加载 {uploaded_file.name}")
+
+                # 清理临时文件
+                os.unlink(tmp_file_path)
+
+            except Exception as e:
+                st.sidebar.error(f"处理文件 {uploaded_file.name} 时出错: {e}")
         if documents:
             with st.spinner("正在构建或更新向量数据库，请稍候..."):
-                if st.session_state.vector_store[selected_session] is None:
-                    # 构建新的向量数据库
-                    st.session_state.vector_store[selected_session] = data_utils.build_vector_store_from_documents(
-                        documents,
-                        vector_store_path
-                    )
+                if st.session_state.vector_store is None:
+                    # 如果 vector_store 未初始化，则创建新的向量存储
+                    st.session_state.vector_store = data_utils.build_vector_store_from_documents(
+                        documents, st.session_state.vector_store_path)
                 else:
-                    # 添加新的文档到现有的向量数据库
+                    # 否则，添加文档到现有的向量存储
                     data_utils.add_documents_to_vector_store(
-                        st.session_state.vector_store[selected_session],
+                        st.session_state.vector_store,
                         documents
                     )
-                st.session_state.vector_store[selected_session].save_local(vector_store_path)
-                st.sidebar.success("向量数据库已更新。")
 
     # 如果已经有 vector_store 并且 qa_chain 未初始化
-    if st.session_state.vector_store[selected_session] and st.session_state.qa_chain[selected_session] is None:
-        retriever = st.session_state.vector_store[selected_session].as_retriever(search_kwargs={"k": 2})
+    if st.session_state.vector_store and selected_session not in st.session_state.qa_chain:
+        retriever = st.session_state.vector_store.as_retriever(search_kwargs={"k": 5, "score_threshold": 0.7})
         st.session_state.qa_chain[selected_session] = ConversationalRetrievalChain.from_llm(
             llm=chat_model,
             retriever=retriever,
-            return_source_documents=False  # 设置为 False，以简洁输出
+            return_source_documents=True,
+            verbose=True
         )
 
     # 显示完整的对话历史（多栏布局）
@@ -146,27 +144,28 @@ def main():
             stop_flag["stop"] = True
 
         # 生成回答
-        if st.session_state.qa_chain[selected_session] and st.session_state.vector_store[selected_session]:
+        if st.session_state.qa_chain.get(selected_session) and st.session_state.vector_store:
             # 尝试从文档中回答
-            answer = data_utils.conversational_answer(
+            response = data_utils.conversational_answer(
                 chain=st.session_state.qa_chain[selected_session],
                 question=user_question,
                 stop_flag=stop_flag,
-                history=st.session_state.conversation_history[selected_session]
-            )
-            # 如果回答为空或未找到回答，则使用 fallback_chain
-            if not answer.strip() or answer == "未找到回答。":
-                st.session_state.conversation_history[selected_session].append(
-                    ("assistant", "在文档中未找到相关信息，以下是基于大模型的回答：")
-                )
+                history=st.session_state.conversation_history[selected_session],
 
+            )
+            answer = response.get("answer", "抱歉，我无法生成回答。")
+            source_documents = response.get("source_documents", [])
+
+            # 如果回答为空或未找到回答，则使用 fallback_chain
+            if not source_documents:
                 fallback_answer = data_utils.conversational_answer(
                     chain=st.session_state.fallback_chain,
                     question=user_question,
                     stop_flag=stop_flag,
                     history=st.session_state.conversation_history[selected_session]
                 )
-                st.session_state.conversation_history[selected_session].append(("assistant", fallback_answer))
+                st.session_state.conversation_history[selected_session].append(
+                    ("assistant", "在文档中未找到相关信息，以下是基于大模型的回答：" + fallback_answer.get('answer')))
             else:
                 st.session_state.conversation_history[selected_session].append(("assistant", answer))
         else:
@@ -177,7 +176,8 @@ def main():
                 stop_flag=stop_flag,
                 history=st.session_state.conversation_history[selected_session]
             )
-            st.session_state.conversation_history[selected_session].append(("assistant", fallback_answer))
+            st.session_state.conversation_history[selected_session].append(
+                ("assistant", "vector_store未创建" + fallback_answer.get('answer')))
 
         # 保存对话历史
         data_utils.save_conversation_history(selected_session, st.session_state.conversation_history[selected_session])
@@ -188,8 +188,6 @@ def main():
         # 显示更新后的对话历史
         ui.display_chat_history(st.session_state.conversation_history[selected_session])
 
-    if 'fallback_chain' not in st.session_state:
-        st.session_state.fallback_chain = fallback_chain
 
 if __name__ == "__main__":
     main()
